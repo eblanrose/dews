@@ -1,19 +1,16 @@
-CC = gcc
-CFLAGS = -Wall -O2
-LIBS = -lssl -lcrypto
+# dews/Makefile
+CC=gcc
+CFLAGS=-fPIC -O2 -Wall $(shell pkg-config --cflags openssl)
+LIBS=$(shell pkg-config --libs openssl)
+AR=ar
 
 all: libdews.a
 
 libdews.a: dews.o
-	ar rcs $@ $^
+	$(AR) rcs $@ $^
 
 dews.o: dews.c dews.h
 	$(CC) $(CFLAGS) -c dews.c -o dews.o
 
 clean:
-	rm -f *.o *.a *.so
-
-install: libdews.a
-	mkdir -p ../lib
-	cp libdews.a ../lib/
-	cp dews.h ../include/
+	rm -f *.o *.a
