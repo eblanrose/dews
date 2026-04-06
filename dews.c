@@ -7,8 +7,31 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <arpa/inet.h>
+#include <limits.h>
 
 static const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+static size_t safe_strlen(const char* s, size_t max_len) {
+    if (!s) return 0;
+    size_t len = 0;
+    while (len < max_len && s[len]) len++;
+    return len;
+}
+
+static int safe_memcpy(void* dest, size_t dest_size, const void* src, size_t src_len) {
+    if (!dest || !src || dest_size == 0) return -1;
+    if (src_len > dest_size) return -1;
+    memcpy(dest, src, src_len);
+    return 0;
+}
+
+static int safe_strncpy(char* dest, const char* src, size_t dest_size) {
+    if (!dest || !src || dest_size == 0) return -1;
+    size_t src_len = safe_strlen(src, dest_size - 1);
+    if (safe_memcpy(dest, dest_size, src, src_len) != 0) return -1;
+    dest[src_len] = '\0';
+    return 0;
+}
 
 void dews_gen_accept_key(const char* key, char* out, size_t out_len) {
     if (!key || !out || out_len < 29) {
@@ -17,10 +40,19 @@ void dews_gen_accept_key(const char* key, char* out, size_t out_len) {
     }
     
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s%s", key, WS_GUID);
+    size_t key_len = safe_strlen(key, sizeof(buf) - 37);
+    if (key_len + 36 >= sizeof(buf)) {
+        out[0] = '\0';
+        return;
+    }
+    
+    memcpy(buf, key, key_len);
+    memcpy(buf + key_len, WS_GUID, 36);
+    size_t total_len = key_len + 36;
+    buf[total_len] = '\0';
     
     unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1((const unsigned char*)buf, strlen(buf), hash);
+    SHA1((const unsigned char*)buf, total_len, hash);
     
     EVP_EncodeBlock((unsigned char*)out, hash, SHA_DIGEST_LENGTH);
     out[28] = '\0';
@@ -36,6 +68,8 @@ dews_client* dews_create(int fd) {
     c->waiting_pong = false;
     c->fragment_count = 0;
     c->current_opcode = 0;
+    c->read_len = 0;
+    c->write_len = 0;
     
     pthread_mutex_init(&c->lock, NULL);
     
@@ -47,10 +81,10 @@ void dews_destroy(dews_client* c) {
     
     pthread_mutex_lock(&c->lock);
     
-    // Free fragments
     for (int i = 0; i < c->fragment_count; i++) {
         if (c->fragments[i].data) {
             free(c->fragments[i].data);
+            c->fragments[i].data = NULL;
         }
     }
     
@@ -92,24 +126,25 @@ void dews_set_ping_callbacks(dews_client* c,
 
 static int send_frame(dews_client* c, uint8_t op, const uint8_t* payload, uint64_t len) {
     if (!c || c->state != DEWS_STATE_OPEN) return -1;
+    if (len > DEWS_MAX_FRAME_SIZE) return -1;
     
     uint8_t header[14];
     size_t hlen = 2;
     
-    header[0] = 0x80 | (op & 0x0F);  // FIN bit set
-    header[1] = 0x00;  // No mask from server
+    header[0] = 0x80 | (op & 0x0F);
+    header[1] = 0x00;
     
     if (len <= 125) {
-        header[1] |= len;
+        header[1] |= (uint8_t)len;
     } else if (len <= 65535) {
         header[1] |= 126;
-        header[2] = (len >> 8) & 0xFF;
-        header[3] = len & 0xFF;
+        header[2] = (uint8_t)((len >> 8) & 0xFF);
+        header[3] = (uint8_t)(len & 0xFF);
         hlen = 4;
     } else {
         header[1] |= 127;
         for (int i = 0; i < 8; i++) {
-            header[2 + i] = (len >> (56 - i * 8)) & 0xFF;
+            header[2 + i] = (uint8_t)((len >> (56 - i * 8)) & 0xFF);
         }
         hlen = 10;
     }
@@ -117,7 +152,7 @@ static int send_frame(dews_client* c, uint8_t op, const uint8_t* payload, uint64
     ssize_t sent = send(c->fd, header, hlen, MSG_NOSIGNAL);
     if (sent < 0 || (size_t)sent != hlen) return -1;
     
-    if (len && payload) {
+    if (len > 0 && payload) {
         sent = send(c->fd, payload, len, MSG_NOSIGNAL);
         if (sent < 0 || (size_t)sent != len) return -1;
     }
@@ -125,62 +160,13 @@ static int send_frame(dews_client* c, uint8_t op, const uint8_t* payload, uint64
     return 0;
 }
 
-static int send_fragmented_frame(dews_client* c, uint8_t op, const uint8_t* data, uint64_t len) {
-    if (!c || c->state != DEWS_STATE_OPEN) return -1;
-    
-    const uint64_t max_chunk = 16384;  // 16KB chunks
-    uint64_t offset = 0;
-    bool first = true;
-    
-    while (offset < len) {
-        uint64_t chunk_size = len - offset;
-        if (chunk_size > max_chunk) chunk_size = max_chunk;
-        
-        uint8_t header[14];
-        size_t hlen = 2;
-        
-        uint8_t opcode = first ? op : DEWS_CONTINUATION;
-        uint8_t fin = (offset + chunk_size >= len) ? 0x80 : 0x00;
-        
-        header[0] = fin | (opcode & 0x0F);
-        header[1] = 0x00;  // No mask
-        
-        if (chunk_size <= 125) {
-            header[1] |= chunk_size;
-        } else if (chunk_size <= 65535) {
-            header[1] |= 126;
-            header[2] = (chunk_size >> 8) & 0xFF;
-            header[3] = chunk_size & 0xFF;
-            hlen = 4;
-        } else {
-            header[1] |= 127;
-            for (int i = 0; i < 8; i++) {
-                header[2 + i] = (chunk_size >> (56 - i * 8)) & 0xFF;
-            }
-            hlen = 10;
-        }
-        
-        if (send(c->fd, header, hlen, MSG_NOSIGNAL) < 0) return -1;
-        if (send(c->fd, data + offset, chunk_size, MSG_NOSIGNAL) < 0) return -1;
-        
-        offset += chunk_size;
-        first = false;
-    }
-    
-    return 0;
-}
-
 int dews_send_text(dews_client* c, const char* txt, uint64_t len) {
     if (!c || !txt || c->state != DEWS_STATE_OPEN) return -1;
-    if (len == 0) len = strlen(txt);
+    if (len == 0) len = safe_strlen(txt, DEWS_MAX_FRAME_SIZE);
+    if (len > DEWS_MAX_FRAME_SIZE) return -1;
     
     pthread_mutex_lock(&c->lock);
-    int result;
-    if (len > 16384) {
-        result = send_fragmented_frame(c, DEWS_TEXT, (const uint8_t*)txt, len);
-    } else {
-        result = send_frame(c, DEWS_TEXT, (const uint8_t*)txt, len);
-    }
+    int result = send_frame(c, DEWS_TEXT, (const uint8_t*)txt, len);
     pthread_mutex_unlock(&c->lock);
     
     return result;
@@ -188,14 +174,10 @@ int dews_send_text(dews_client* c, const char* txt, uint64_t len) {
 
 int dews_send_binary(dews_client* c, const uint8_t* data, uint64_t len) {
     if (!c || !data || c->state != DEWS_STATE_OPEN) return -1;
+    if (len > DEWS_MAX_FRAME_SIZE) return -1;
     
     pthread_mutex_lock(&c->lock);
-    int result;
-    if (len > 16384) {
-        result = send_fragmented_frame(c, DEWS_BINARY, data, len);
-    } else {
-        result = send_frame(c, DEWS_BINARY, data, len);
-    }
+    int result = send_frame(c, DEWS_BINARY, data, len);
     pthread_mutex_unlock(&c->lock);
     
     return result;
@@ -203,7 +185,7 @@ int dews_send_binary(dews_client* c, const uint8_t* data, uint64_t len) {
 
 int dews_send_ping(dews_client* c, const uint8_t* data, uint64_t len) {
     if (!c || c->state != DEWS_STATE_OPEN) return -1;
-    if (len > 125) len = 125;  // Max payload for ping/pong
+    if (len > DEWS_MAX_PAYLOAD_SIZE) len = DEWS_MAX_PAYLOAD_SIZE;
     
     pthread_mutex_lock(&c->lock);
     int result = send_frame(c, DEWS_PING, data, len);
@@ -218,7 +200,7 @@ int dews_send_ping(dews_client* c, const uint8_t* data, uint64_t len) {
 
 int dews_send_pong(dews_client* c, const uint8_t* data, uint64_t len) {
     if (!c || c->state != DEWS_STATE_OPEN) return -1;
-    if (len > 125) len = 125;
+    if (len > DEWS_MAX_PAYLOAD_SIZE) len = DEWS_MAX_PAYLOAD_SIZE;
     
     pthread_mutex_lock(&c->lock);
     int result = send_frame(c, DEWS_PONG, data, len);
@@ -242,16 +224,16 @@ int dews_send_close(dews_client* c, uint16_t code, const char* reason) {
     uint8_t buf[128];
     size_t len = 0;
     
-    if (code) {
-        buf[len++] = (code >> 8) & 0xFF;
-        buf[len++] = code & 0xFF;
+    if (code != 0) {
+        buf[len++] = (uint8_t)((code >> 8) & 0xFF);
+        buf[len++] = (uint8_t)(code & 0xFF);
     }
     
-    if (reason) {
-        size_t rlen = strlen(reason);
-        if (rlen > sizeof(buf) - len - 1) rlen = sizeof(buf) - len - 1;
-        memcpy(buf + len, reason, rlen);
-        len += rlen;
+    if (reason && len < sizeof(buf) - 1) {
+        size_t rlen = safe_strlen(reason, sizeof(buf) - len - 1);
+        if (safe_memcpy(buf + len, sizeof(buf) - len, reason, rlen) == 0) {
+            len += rlen;
+        }
     }
     
     send_frame(c, DEWS_CLOSE, buf, len);
@@ -262,10 +244,10 @@ int dews_send_close(dews_client* c, uint16_t code, const char* reason) {
 }
 
 static int decode_frame(dews_client* c) {
+    if (!c || c->read_len < 2) return 0;
+    
     uint8_t* data = c->read_buf;
     size_t len = c->read_len;
-    
-    if (len < 2) return 0;
     
     uint8_t fin = (data[0] & 0x80) != 0;
     uint8_t op = data[0] & 0x0F;
@@ -273,7 +255,6 @@ static int decode_frame(dews_client* c) {
     uint64_t plen = data[1] & 0x7F;
     size_t hlen = 2;
     
-    // Client MUST mask frames, server MUST NOT
     if (!masked) {
         if (c->on_error) c->on_error(c, "Unmasked frame from client");
         return -1;
@@ -292,7 +273,6 @@ static int decode_frame(dews_client* c) {
         hlen = 10;
     }
     
-    // Check frame size limit
     if (plen > DEWS_MAX_FRAME_SIZE) {
         if (c->on_error) c->on_error(c, "Frame too large");
         return -1;
@@ -301,7 +281,7 @@ static int decode_frame(dews_client* c) {
     if (len < hlen + 4) return 0;
     
     uint8_t mask[4];
-    memcpy(mask, data + hlen, 4);
+    if (safe_memcpy(mask, sizeof(mask), data + hlen, 4) != 0) return -1;
     hlen += 4;
     
     if (len < hlen + plen) return 0;
@@ -311,60 +291,76 @@ static int decode_frame(dews_client* c) {
         payload[i] ^= mask[i % 4];
     }
     
-    // Handle fragmented frames
     if (!fin) {
         if (op != DEWS_CONTINUATION && c->fragment_count == 0) {
             c->current_opcode = op;
         }
         
-        if (c->fragment_count < DEWS_MAX_FRAGMENTED_FRAMES) {
+        if (c->fragment_count < DEWS_MAX_FRAGMENTED_FRAMES && plen > 0) {
             uint8_t* fragment_data = (uint8_t*)malloc(plen);
             if (fragment_data) {
-                memcpy(fragment_data, payload, plen);
-                c->fragments[c->fragment_count].data = fragment_data;
-                c->fragments[c->fragment_count].len = plen;
-                c->fragments[c->fragment_count].opcode = op;
-                c->fragment_count++;
+                if (safe_memcpy(fragment_data, plen, payload, plen) == 0) {
+                    c->fragments[c->fragment_count].data = fragment_data;
+                    c->fragments[c->fragment_count].len = plen;
+                    c->fragments[c->fragment_count].opcode = op;
+                    c->fragment_count++;
+                } else {
+                    free(fragment_data);
+                }
             }
         }
     } else {
-        // Final frame - assemble message
         if (op == DEWS_CONTINUATION && c->fragment_count > 0) {
-            // Calculate total size
             uint64_t total_len = plen;
             for (int i = 0; i < c->fragment_count; i++) {
                 total_len += c->fragments[i].len;
             }
             
-            uint8_t* assembled = (uint8_t*)malloc(total_len);
-            if (assembled) {
-                uint64_t offset = 0;
-                for (int i = 0; i < c->fragment_count; i++) {
-                    memcpy(assembled + offset, c->fragments[i].data, c->fragments[i].len);
-                    offset += c->fragments[i].len;
-                    free(c->fragments[i].data);
-                    c->fragments[i].data = NULL;
+            if (total_len <= DEWS_MAX_FRAME_SIZE) {
+                uint8_t* assembled = (uint8_t*)malloc(total_len);
+                if (assembled) {
+                    uint64_t offset = 0;
+                    int valid = 1;
+                    
+                    for (int i = 0; i < c->fragment_count && valid; i++) {
+                        if (safe_memcpy(assembled + offset, total_len - offset,
+                                       c->fragments[i].data, c->fragments[i].len) == 0) {
+                            offset += c->fragments[i].len;
+                        } else {
+                            valid = 0;
+                        }
+                        free(c->fragments[i].data);
+                        c->fragments[i].data = NULL;
+                    }
+                    
+                    if (valid && safe_memcpy(assembled + offset, total_len - offset,
+                                            payload, plen) == 0) {
+                        if (c->on_msg) {
+                            c->on_msg(c, c->current_opcode, assembled, total_len);
+                        }
+                    }
+                    
+                    free(assembled);
                 }
-                memcpy(assembled + offset, payload, plen);
-                
-                if (c->on_msg) {
-                    c->on_msg(c, c->current_opcode, assembled, total_len);
-                }
-                
-                free(assembled);
             }
+            
             c->fragment_count = 0;
             c->current_opcode = 0;
-        } else if (op != DEWS_CONTINUATION) {
-            // Single frame message
+        } else if (op != DEWS_CONTINUATION && plen > 0) {
             if (c->on_msg) {
-                c->on_msg(c, op, payload, plen);
+                uint8_t* msg_data = (uint8_t*)malloc(plen);
+                if (msg_data) {
+                    if (safe_memcpy(msg_data, plen, payload, plen) == 0) {
+                        c->on_msg(c, op, msg_data, plen);
+                    }
+                    free(msg_data);
+                }
             }
         }
     }
     
-    // Handle control frames
     if (op == DEWS_PING) {
+        if (plen > DEWS_MAX_PAYLOAD_SIZE) plen = DEWS_MAX_PAYLOAD_SIZE;
         dews_send_pong(c, payload, plen);
         if (c->on_ping) c->on_ping(c, payload, plen);
     } else if (op == DEWS_PONG) {
@@ -406,6 +402,12 @@ int dews_process(dews_client* c) {
         return -1;
     }
     
+    if (c->read_len >= DEWS_BUFFER_SIZE - 1) {
+        if (c->on_error) c->on_error(c, "Read buffer full");
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    
     ssize_t n = recv(c->fd, c->read_buf + c->read_len, 
                      DEWS_BUFFER_SIZE - c->read_len - 1, MSG_DONTWAIT);
     
@@ -425,6 +427,7 @@ int dews_process(dews_client* c) {
     }
     
     c->read_len += n;
+    c->read_buf[c->read_len] = '\0';
     
     int result = 0;
     while (c->read_len >= 2 && result >= 0) {
@@ -464,12 +467,10 @@ void dews_timer_update(dews_client* c) {
     
     pthread_mutex_lock(&c->lock);
     
-    // Send ping if needed
     if (!c->waiting_pong && (now - c->last_pong_received) >= DEWS_PING_INTERVAL) {
         dews_send_ping(c, (const uint8_t*)"ping", 4);
     }
     
-    // Check for pong timeout
     if (c->waiting_pong && (now - c->last_ping_sent) >= DEWS_PONG_TIMEOUT) {
         if (c->on_error) c->on_error(c, "Pong timeout");
         c->state = DEWS_STATE_CLOSED;
