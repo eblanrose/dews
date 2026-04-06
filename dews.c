@@ -20,9 +20,17 @@ static size_t safe_strlen(const char* s, size_t max_len) {
 
 static int safe_memcpy(void* dest, size_t dest_size, const void* src, size_t src_len) {
     if (!dest || !src || dest_size == 0) return -1;
-    if (src_len > dest_size) return -1;
     if (src_len == 0) return 0;
-    memcpy(dest, src, src_len);
+    if (src_len > dest_size) return -1;
+    
+    // Используем посимвольное копирование для безопасности
+    const unsigned char* s = (const unsigned char*)src;
+    unsigned char* d = (unsigned char*)dest;
+    
+    for (size_t i = 0; i < src_len; i++) {
+        if (i >= dest_size) return -1;
+        d[i] = s[i];
+    }
     return 0;
 }
 
@@ -59,7 +67,12 @@ void dews_gen_accept_key(const char* key, char* out, size_t out_len) {
     }
     
     size_t total_len = key_len + 36;
-    buf[total_len] = '\0';
+    if (total_len < sizeof(buf)) {
+        buf[total_len] = '\0';
+    } else {
+        out[0] = '\0';
+        return;
+    }
     
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1((const unsigned char*)buf, total_len, hash);
@@ -235,14 +248,18 @@ int dews_send_close(dews_client* c, uint16_t code, const char* reason) {
     size_t len = 0;
     
     if (code != 0) {
-        buf[len++] = (uint8_t)((code >> 8) & 0xFF);
-        buf[len++] = (uint8_t)(code & 0xFF);
+        if (len + 2 <= sizeof(buf)) {
+            buf[len++] = (uint8_t)((code >> 8) & 0xFF);
+            buf[len++] = (uint8_t)(code & 0xFF);
+        }
     }
     
     if (reason && len < sizeof(buf) - 1) {
         size_t rlen = safe_strlen(reason, sizeof(buf) - len - 1);
-        if (rlen > 0 && safe_memcpy(buf + len, sizeof(buf) - len, reason, rlen) == 0) {
-            len += rlen;
+        if (rlen > 0 && len + rlen <= sizeof(buf)) {
+            if (safe_memcpy(buf + len, sizeof(buf) - len, reason, rlen) == 0) {
+                len += rlen;
+            }
         }
     }
     
@@ -334,6 +351,7 @@ static int decode_frame(dews_client* c) {
                     
                     for (int i = 0; i < c->fragment_count && valid; i++) {
                         if (c->fragments[i].len > 0 &&
+                            offset + c->fragments[i].len <= total_len &&
                             safe_memcpy(assembled + offset, total_len - offset,
                                        c->fragments[i].data, c->fragments[i].len) == 0) {
                             offset += c->fragments[i].len;
@@ -345,6 +363,7 @@ static int decode_frame(dews_client* c) {
                     }
                     
                     if (valid && plen > 0 &&
+                        offset + plen <= total_len &&
                         safe_memcpy(assembled + offset, total_len - offset,
                                    payload, plen) == 0) {
                         if (c->on_msg) {
@@ -396,7 +415,9 @@ static int decode_frame(dews_client* c) {
     size_t consumed = hlen + plen;
     if (consumed < c->read_len) {
         size_t remaining = c->read_len - consumed;
-        memmove(c->read_buf, c->read_buf + consumed, remaining);
+        if (remaining > 0 && remaining <= DEWS_BUFFER_SIZE) {
+            memmove(c->read_buf, c->read_buf + consumed, remaining);
+        }
         c->read_len = remaining;
     } else {
         c->read_len = 0;
@@ -440,7 +461,9 @@ int dews_process(dews_client* c) {
     }
     
     c->read_len += n;
-    c->read_buf[c->read_len] = '\0';
+    if (c->read_len < DEWS_BUFFER_SIZE) {
+        c->read_buf[c->read_len] = '\0';
+    }
     
     int result = 0;
     while (c->read_len >= 2 && result >= 0) {
@@ -462,7 +485,9 @@ int dews_process_write(dews_client* c) {
         if (sent > 0) {
             if ((size_t)sent < c->write_len) {
                 size_t remaining = c->write_len - sent;
-                memmove(c->write_buf, c->write_buf + sent, remaining);
+                if (remaining > 0 && remaining <= DEWS_BUFFER_SIZE) {
+                    memmove(c->write_buf, c->write_buf + sent, remaining);
+                }
                 c->write_len = remaining;
             } else {
                 c->write_len = 0;
