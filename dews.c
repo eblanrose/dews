@@ -23,7 +23,6 @@ static int safe_memcpy(void* dest, size_t dest_size, const void* src, size_t src
     if (src_len == 0) return 0;
     if (src_len > dest_size) return -1;
     
-    // Используем посимвольное копирование для безопасности
     const unsigned char* s = (const unsigned char*)src;
     unsigned char* d = (unsigned char*)dest;
     
@@ -55,7 +54,6 @@ void dews_gen_accept_key(const char* key, char* out, size_t out_len) {
         return;
     }
     
-    // Безопасное копирование с проверкой границ
     if (safe_memcpy(buf, sizeof(buf), key, key_len) != 0) {
         out[0] = '\0';
         return;
@@ -415,7 +413,7 @@ static int decode_frame(dews_client* c) {
     size_t consumed = hlen + plen;
     if (consumed < c->read_len) {
         size_t remaining = c->read_len - consumed;
-        if (remaining > 0 && remaining <= DEWS_BUFFER_SIZE) {
+        if (remaining <= DEWS_BUFFER_SIZE) {
             memmove(c->read_buf, c->read_buf + consumed, remaining);
         }
         c->read_len = remaining;
@@ -485,7 +483,7 @@ int dews_process_write(dews_client* c) {
         if (sent > 0) {
             if ((size_t)sent < c->write_len) {
                 size_t remaining = c->write_len - sent;
-                if (remaining > 0 && remaining <= DEWS_BUFFER_SIZE) {
+                if (remaining <= DEWS_BUFFER_SIZE) {
                     memmove(c->write_buf, c->write_buf + sent, remaining);
                 }
                 c->write_len = remaining;
