@@ -21,6 +21,7 @@ static size_t safe_strlen(const char* s, size_t max_len) {
 static int safe_memcpy(void* dest, size_t dest_size, const void* src, size_t src_len) {
     if (!dest || !src || dest_size == 0) return -1;
     if (src_len > dest_size) return -1;
+    if (src_len == 0) return 0;
     memcpy(dest, src, src_len);
     return 0;
 }
@@ -46,8 +47,17 @@ void dews_gen_accept_key(const char* key, char* out, size_t out_len) {
         return;
     }
     
-    memcpy(buf, key, key_len);
-    memcpy(buf + key_len, WS_GUID, 36);
+    // Безопасное копирование с проверкой границ
+    if (safe_memcpy(buf, sizeof(buf), key, key_len) != 0) {
+        out[0] = '\0';
+        return;
+    }
+    
+    if (safe_memcpy(buf + key_len, sizeof(buf) - key_len, WS_GUID, 36) != 0) {
+        out[0] = '\0';
+        return;
+    }
+    
     size_t total_len = key_len + 36;
     buf[total_len] = '\0';
     
@@ -231,7 +241,7 @@ int dews_send_close(dews_client* c, uint16_t code, const char* reason) {
     
     if (reason && len < sizeof(buf) - 1) {
         size_t rlen = safe_strlen(reason, sizeof(buf) - len - 1);
-        if (safe_memcpy(buf + len, sizeof(buf) - len, reason, rlen) == 0) {
+        if (rlen > 0 && safe_memcpy(buf + len, sizeof(buf) - len, reason, rlen) == 0) {
             len += rlen;
         }
     }
@@ -316,14 +326,15 @@ static int decode_frame(dews_client* c) {
                 total_len += c->fragments[i].len;
             }
             
-            if (total_len <= DEWS_MAX_FRAME_SIZE) {
+            if (total_len <= DEWS_MAX_FRAME_SIZE && total_len > 0) {
                 uint8_t* assembled = (uint8_t*)malloc(total_len);
                 if (assembled) {
                     uint64_t offset = 0;
                     int valid = 1;
                     
                     for (int i = 0; i < c->fragment_count && valid; i++) {
-                        if (safe_memcpy(assembled + offset, total_len - offset,
+                        if (c->fragments[i].len > 0 &&
+                            safe_memcpy(assembled + offset, total_len - offset,
                                        c->fragments[i].data, c->fragments[i].len) == 0) {
                             offset += c->fragments[i].len;
                         } else {
@@ -333,8 +344,9 @@ static int decode_frame(dews_client* c) {
                         c->fragments[i].data = NULL;
                     }
                     
-                    if (valid && safe_memcpy(assembled + offset, total_len - offset,
-                                            payload, plen) == 0) {
+                    if (valid && plen > 0 &&
+                        safe_memcpy(assembled + offset, total_len - offset,
+                                   payload, plen) == 0) {
                         if (c->on_msg) {
                             c->on_msg(c, c->current_opcode, assembled, total_len);
                         }
@@ -383,8 +395,9 @@ static int decode_frame(dews_client* c) {
     
     size_t consumed = hlen + plen;
     if (consumed < c->read_len) {
-        memmove(c->read_buf, c->read_buf + consumed, c->read_len - consumed);
-        c->read_len -= consumed;
+        size_t remaining = c->read_len - consumed;
+        memmove(c->read_buf, c->read_buf + consumed, remaining);
+        c->read_len = remaining;
     } else {
         c->read_len = 0;
     }
@@ -448,8 +461,9 @@ int dews_process_write(dews_client* c) {
         ssize_t sent = send(c->fd, c->write_buf, c->write_len, MSG_NOSIGNAL);
         if (sent > 0) {
             if ((size_t)sent < c->write_len) {
-                memmove(c->write_buf, c->write_buf + sent, c->write_len - sent);
-                c->write_len -= sent;
+                size_t remaining = c->write_len - sent;
+                memmove(c->write_buf, c->write_buf + sent, remaining);
+                c->write_len = remaining;
             } else {
                 c->write_len = 0;
             }
